@@ -414,24 +414,38 @@ MEMORY_TOGGLE = "memory.toggle"
 MEMORY_OPEN   = "memory.open"
 ```
 
-**产品侧的注册与实现** —— 这五个是 **API 能力**（供集成层调用），不是界面功能承诺。客户问的「修改画像」能力就落在这里，且**只有改 / 新建，没有删除**：
+**产品侧的注册与实现** —— 这五个是 **API 能力**（供集成层调用），不是界面功能承诺。
+⚠️ **关键限定：这套接口管理的是「记忆文件」，不是「画像字段」**。可写范围见下方路径守卫表——**画像文件 `memory/USER.md` 对这套 RPC 是只读的**（由 agent 自动维护），且整套方法**只有改 / 新建，没有删除**。
 
 ```python
 # 注册：AgentServer 启动时挂进 AdapterRegistry，按 req_method 命中
 MemoryAdapter()            # jiuwenswarm/server/agent_ws_server.py:1374 与 :2416
 methods = frozenset({ReqMethod.MEMORY_LIST.value, ...})   # memory_adapter.py:35-43
 
-# 实现：真正干活的五个 handler（内置本地记忆）
+# 实现：真正干活的五个 handler
 handle_memory_list(...)    # memory_rpc.py:258   列出可管理的记忆文件（含路径守卫与分类）
-handle_memory_edit(...)    # memory_rpc.py:301   编辑 / 新建记忆与画像文件（限定在允许目录内）
+handle_memory_edit(...)    # memory_rpc.py:301   编辑 / 新建记忆文件（画像 memory/USER.md 不在可写范围）
 handle_memory_status(...)  # memory_rpc.py:352   记忆子系统状态（含禁记规则开关状态）
 handle_memory_toggle(...)  # memory_rpc.py:459   按 mode 维度开 / 关记忆能力，写回配置
 handle_memory_open(...)    # memory_rpc.py:604   定位到具体记忆文件
 
 # 路径守卫（安全边界）
 _validate_edit_path(...)   # memory_rpc.py:115   只允许 _get_allowed_dirs() 内的路径，拦目录越界与符号链接逃逸
-_classify_memory_file(...) # memory_rpc.py:154   区分画像 / 长期记忆 / 编码记忆
+_classify_memory_file(...) # memory_rpc.py:154   分类：coding / auto / project / local / user
 ```
+
+**`memory.edit` 实际可写范围（已逐行核对 `_validate_edit_path` / `_get_allowed_dirs` / `_is_runtime_memory_path`）**：
+
+| 路径 | 能否改 | 依据 |
+|---|---|---|
+| `<agent_workspace>/memory/**`（含 `memory/USER.md`、`memory/MEMORY.md`、`memory/*.md`） | ❌ **只读** | `memory_rpc.py:130-131` → `"runtime memory is read-only, manual editing is not allowed"` |
+| `<agent_workspace>/coding_memory/**` | ❌ **只读** | 同上（`_get_runtime_memory_dirs` 含之） |
+| `<agent_workspace>/.jiuwen/**` | ✅ 可写 | `_get_allowed_dirs` |
+| `~/.jiuwen/**` | ✅ 可写 | `_get_allowed_dirs` |
+| `<project_dir>/**` 与 `<project_dir>/.jiuwen/**` | ✅ 可写 | `_get_allowed_dirs`（`project_dir` 由 TUI 的 `trusted_dirs` / `cwd` 补全） |
+| `<agent_workspace>/JIUWENSWARM.md` / `JIUWENSWARM.local.md` | ✅ 可写 / 可新建 | `_validate_edit_path:136-149` 特例 |
+
+> **由此得出对客户问题 4 的准确答案**：这套 RPC 能改的是 **`.jiuwen` / 项目目录 / 用户级目录**；**画像 `memory/USER.md` 与长期记忆 `memory/MEMORY.md` 由 agent 自动维护、对接口只读**。所以「修改画像」**没有面向集成层的字段级接口**，只有模型侧的记忆工具能写（见下表）。
 
 > **边界自述（`memory_adapter.py:1-7` 原文照录）**：
 > ```python
@@ -472,11 +486,23 @@ PersonalContextHostAPI:
   get_authorization_status / authorize_provider          # GitHub/GitCode 等源授权（PAT 校验，15 s 超时）
 ```
 
-### 4.6 注意事项
+### 4.6 客户问题四项逐条答复（先把问题对上，再看接口）
+
+| 客户问的 | 我们的答复 | 依据 |
+|---|---|---|
+| **画像 schema** | **没有**。画像与记忆都是自由文本 Markdown（`memory/USER.md` 模板为 0 字节空文件），无 JSON Schema、无字段类型、无版本号 | `resources/agent/workspace/` 模板 |
+| **画像来源** | 三条：① **模型**在对话中调 `write_memory` / `edit_memory` 写入 `memory/USER.md`（**群聊场景被硬禁**）② **会话结束抽取**（`session_end_extract`）③ 可选 **`PersonalContext`** 子系统从外部源采集（GitHub / GitCode 等，需 PAT 授权） | `memory_tools.py:61-84,291,362`、`config.yaml` 的 `memory.builtin.jiuwen.session_end_extract`、`personal_context/host_api.py` |
+| **修改接口** | **没有面向集成层的画像字段接口**。能改画像的只有**模型侧工具**（且只允许 `memory/` 目录内）；前端 RPC 的 `memory.edit` 对 `memory/**` 是**只读**。集成层若要程序化改画像 → 只能直接改文件，或走 `PersonalContext` 的 `apply_master` | 见 §4.3 可写范围表 |
+| **删除接口** | **没有**。五个 handler 中无 delete；无「删单条画像 / 按主体清除 / 导出画像」RPC。只能删文件本体（运维层面），或删采集源 `delete_fetch_service` | `memory_rpc.py` |
+| **隐私边界** | 禁记规则（默认关闭）+ 群聊禁写；但**规则只在模型写入侧生效**，`memory.edit` 不校验 patterns；无 PII 正则、无加密落盘 | §4.4 |
+
+> **一句话结论**：**画像没有 schema、没有字段级读写接口**；它就是一个由模型自动维护的 Markdown 文件（`memory/USER.md`），前端接口对它只读。客户若要求「结构化画像 + 可编程增删改」，需要在集成层自建存储与接口，或基于 `PersonalContext` 二次开发。
+
+### 4.7 注意事项
 1. 画像字段是**自由文本 Markdown**，没有 JSON Schema 与字段类型校验；如客户需要结构化画像（字段、类型、版本），建议在集成层定义 schema 并落到 `USER.md` 之外的自有存储。
 2. 多用户部署**必须**设置 `MEMORY_USER_ID`（及 `scope_id`），否则内置记忆默认落在 `__default__` 标识下，跨用户共享。
 3. 隐私禁记规则默认关闭（`enabled: false`），且属于「提示词 + 工具侧检查」；如需合规级强制脱敏（PII 正则、落盘前过滤、加密分级），建议在集成层前置处理。
-4. 当前提供 `memory.edit`（改）与 `delete_fetch_service`（删采集源），**未提供**「删除单条画像 / 按主体清除 / 导出画像」的 RPC；合规遗忘需求需由集成层基于文件与记忆引擎 API 组合实现。
+4. `memory.edit` 可改 `<agent_workspace>/.jiuwen/**`、`~/.jiuwen/**`、`<project_dir>/**`；**`memory/USER.md` 与 `memory/MEMORY.md` 对接口只读**（agent 自动维护）。因此「改画像」没有集成层接口，只有模型工具；「删除单条画像 / 按主体清除 / 导出画像」的 RPC 也**均未提供**，合规遗忘需求需由集成层基于文件与记忆引擎 API 组合实现。
 5. 外接记忆（`mem0` / `openviking` / `lakebase` / `openjiuwen` provider）**只提供 provider 配置，不提供读写工具与管理 RPC**；接入后检索时机由 rail 预取决定（单轮 5 秒超时）。如客户要求「可管理的外接记忆」，需在集成层自建管理面。
 6. 内置记忆的模型写入侧在**群聊场景被硬禁**（`write_memory` / `edit_memory` 直接返回错误），因此群聊不会自动沉淀个人记忆；这是默认行为，无需配置。
 
