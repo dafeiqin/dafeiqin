@@ -1,5 +1,9 @@
 # JiuwenSwarm 八项能力核查报告
 
+> **⚠️ 覆盖范围提示（2026-11-10 补）**：本底稿只覆盖**前八项**能力。客户后续追加的**十一项**（私有协议接入、断线重连、用户信息透传、跨节点恢复、服务端主动推送、大工具结果、多模态输入、Langfuse 观测、项目管理与目录树、会话分支、文件变更通知）不在此文内。
+> 对外答复见同目录 **`客户答复-JiuwenSwarm追加十一项能力确认.md`**（章节 9–19）；取证索引见 **`index.md` 的「追加 11 项功能核查」一节**；逐条调用链见 **`JiuwenSwarm八项能力-实现对照表.xlsx` 第 9–19 行**。
+> 另：本文件中出现的 `chat.cancel` / `chat.answer` 是 Python 枚举名写法，线上 wire 名实测为 **`chat.interrupt`** / **`chat.user_answer`**（`message.py:89-90`）。
+
 > 核查对象：`openJiuwen-ai/jiuwenswarm`，branch `develop`，包名 `workswarm`，版本 **v0.2.8**（`pyproject.toml`：`python >=3.11,<3.15`，Apache-2.0，文件头为 Huawei Technologies 版权）。
 > 本地副本：`D:\开源项目源码\jiuwenswarm`（浅克隆）。**三个外部依赖仓也已按 `pyproject.toml` 钉住的 rev 克隆到同一目录**：`D:\开源项目源码\agent-gateway`、`agent-core`、`agent-protocol`（rev 与日期见 §10.1）。
 > 方法：只读源码 + 配置模板 + 仓内设计/bugfix 文档。**所有结论后面都带 `文件:行` 指针**；`[外部仓]` 标记的条目已在 §10 逐条闭环，**§10.4 原 6 条也已全部自查闭环**（其中对 §3 凭据隔离与 §1 会话映射两处结论做了更正）。
@@ -288,6 +292,21 @@ memory.forbidden_memory_definition:
 
 `jiuwenswarm/agents/harness/common/memory_rpc.py`：`handle_memory_list` 258、`handle_memory_edit` 301、`handle_memory_status` 352、`handle_memory_toggle` 459（写 `update_memory_forbidden_enabled_in_config`）、`handle_memory_open` 604、`_update_mode_memory_config(mode, field, value)` 582。
 路径守卫：`_validate_edit_path` 115、`_get_allowed_dirs` 57、`_is_in_allowed_dirs` 70、`_get_coding_memory_dir` 44、`_classify_memory_file` 154、`_is_creatable_memory_file` 170、`_safe_stat` 213、`_count_lines` 221、`_scan_md_files` 229。
+
+**⚠️ 本轮更正（重要，之前写成「memory.edit 是画像唯一修改入口」是错的）**：
+- `memory.edit` 的 `_validate_edit_path` **第一步**就把"运行时记忆目录"判死（`memory_rpc.py:129-131`）：`_is_runtime_memory_path()` 命中 `<workspace>/memory` 与 `<agent_workspace>/coding_memory` → 直接返回 `(False, "runtime memory is read-only, manual editing is not allowed")`。
+- 因此**实际可写范围**：`<agent_workspace>/.jiuwen/**`、`~/.jiuwen/**`、`<project_dir>/**`、`<project_dir>/.jiuwen/**`、`<agent_workspace>/JIUWENSWARM(.local).md`（特例 `:136-149`）。
+- **画像路径 = `<agent_workspace>/memory/USER.md`**（`memory_tools.py:61-84` 的 `_validate_memory_path` 白名单：`memory/USER.md`、`memory/MEMORY.md`、`memory/*.md`）→ 对 RPC **只读**；写画像只能靠模型侧 `write_memory` / `edit_memory` 工具。
+- 另注意 `common/utils.py:2379 get_deepagent_user_md_path()` 返回的是 `<workspace>/USER.md`（DeepAgent 侧锚点，推荐系统读它），与记忆工具写的 `memory/USER.md` **不是同一个文件**；两者均不在 `memory.edit` 可写范围。
+
+**对客户问题 4（画像 schema / 来源 / 修改 / 删除）的准确映射**：
+
+| 客户问的 | 实数 | 依据 |
+|---|---|---|
+| schema | **无**（自由文本 md，`USER.md` 模板 0 字节） | `resources/agent/workspace/` |
+| 来源 | ①模型工具写入 `memory/USER.md`（群聊禁写）②`session_end_extract` 会话结束抽取 ③可选 `PersonalContext` 外部采集 | `memory_tools.py:291,362`、`config.yaml`、`personal_context/host_api.py` |
+| 修改接口 | **无字段级接口**；RPC 对 `memory/**` 只读，只有模型工具能写 | 上表 |
+| 删除接口 | **无**（五个 handler 无 delete） | `memory_rpc.py` |
 RPC 入口：`jiuwenswarm/server/runtime/gateway_adapter/memory_adapter.py::MemoryAdapter`（`methods` frozenset 见 `:35-43`；`handle()` 里 `workspace = str(get_agent_workspace_dir())` 见 `:47`）。
 
 **该文件 docstring 是隐私边界的关键自述（1-7 行，原文照录，别再转述）**：
